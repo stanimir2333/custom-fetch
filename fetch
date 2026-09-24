@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+#
+# custom-fetch — fastfetch-like system info + JPEG/PNG → ASCII art (no setup)
+#
+# Usage:
+#   ./fetch --image photo.jpg
+#   ./fetch -i logo.png -w 50 --mode half
+#   ./fetch --image ~/Pictures/wallpaper.jpg --ascii
+#   ./fetch --logo arch            # text logo only (no image)
+#   ./fetch --info-only            # no logo/image
+#
+# Image backends (auto-detected, in order):
+#   1) python3 + Pillow (best, handles JPG/PNG/WebP/GIF/BMP, truecolor)
+#   2) ImageMagick (convert/magick) or ffmpeg -> PPM -> stdlib python renderer
+#   3) pure-python stdlib PNG decoder (zero deps, PNG-only)
+# No terminal graphics protocol (kitty/sixel) needed — plain ANSI, works over SSH.
+#
+set -u
+VERSION="1.0.0"
+
+# ---------- defaults ----------
+IMAGE=""
+WIDTH=40
+MODE="half"          # half | full | ascii | mono
+CHARSET=' .:-=+*#%@'
+COLOR="on"
+SHOW_INFO="on"
+TEXT_LOGO=""         # distro name for text logo fallback
+GAP=4
+
+BOLD=$'\e[1m'; RESET=$'\e[0m'
+C_TITLE=$'\e[1;36m'; C_LABEL=$'\e[1;32m'; C_INFO=$'\e[0m'; C_SEP=$'\e[90m'
+
+# ---------- helpers ----------
+die() { printf 'fetch: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+python_has_pil() { python3 -c 'import PIL.Image' >/dev/null 2>&1; }
+
+usage() {
+  cat <<EOF
+custom-fetch v$VERSION — fastfetch-like fetch with zero-setup image support
+
+Usage:
+  fetch [OPTIONS] [IMAGE]
+
+Options:
+  -i, --image PATH     JPEG/PNG/WebP/GIF/BMP file (or directory: picks first image)
+  -w, --width N        ASCII width in chars (default: 40, range 10-200)
+  --mode MODE          half (default) | full | ascii | mono
+                         half  = ▀ 2 pixels per cell, best fidelity, truecolor
+                         full  = █ 1 pixel per cell, tall but vivid
+                         ascii = charset-mapped, truecolor
+                         mono  = charset-mapped, no color
+  --ascii              shortcut for --mode ascii
+  --mono               shortcut for --mode mono --color off
+  --charset STR        custom charset for ascii/mono (default: ' .:-=+*#%@')
+  --color on|off       ANSI colors (default: on)
+  --logo NAME          use built-in text logo instead of image (arch, ubuntu,
+                       debian, fedora, archlinux, manjaro, mint, pop, alpine, gentoo)
+  --list-logos         list built-in text logos
+  --no-info, --image-only   show image only
+  --info-only               show system info only
+  -h, --help           show this help
+  -v, --version        show version
+
+Examples:
+  fetch --image photo.jpg
+  fetch -i logo.png -w 60 --mode half
+  fetch -i pic.jpg --ascii -w 70
+  fetch ~/Pictures/wallpaper.png
+  fetch --logo arch
+
+Config (optional): ~/.config/custom-fetch/config
+  One KEY=VALUE per line: IMAGE=, WIDTH=, MODE=, CHARSET=, COLOR=
+EOF
+}
+
+list_logos() {
+  printf 'built-in logos: arch ubuntu debian fedora manjaro mint pop alpine gentoo nix nixos void generic\n'
+}
+
+# ---------- arg parsing ----------
+POSITIONAL=""
+while (($#)); do
+  case "${1:-}" in
+    -i|--image) IMAGE="${2:-}"; shift 2 ;;
+    --image=*) IMAGE="${1#*=}"; shift ;;
+    -w|--width) WIDTH="${2:-}"; shift 2 ;;
+    --width=*) WIDTH="${1#*=}"; shift ;;
+    --mode) MODE="${2:-}"; shift 2 ;;
+    --mode=*) MODE="${1#*=}"; shift ;;
+    --charset) CHARSET="${2:-}"; shift 2 ;;
+    --charset=*) CHARSET="${1#*=}"; shift ;;
+    --color) COLOR="${2:-}"; shift 2 ;;
+    --color=*) COLOR="${1#*=}"; shift ;;
+    --ascii) MODE="ascii"; shift ;;
+    --mono) MODE="mono"; COLOR="off"; shift ;;
+    --logo) TEXT_LOGO="${2:-}"; shift 2 ;;
+    --logo=*) TEXT_LOGO="${1#*=}"; shift ;;
+    --list-logos) list_logos; exit 0 ;;
+    --no-info|--image-only) SHOW_INFO="off"; shift ;;
+    --info-only) IMAGE=""; TEXT_LOGO="${TEXT_LOGO:-__none__}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -v|--version) printf 'custom-fetch %s\n' "$VERSION"; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) POSITIONAL="$1"; shift ;;
+  esac
+done
+# bare positional arg = image path
+if [[ -z "$IMAGE" && -n "$POSITIONAL" ]]; then IMAGE="$POSITIONAL"; fi
+
+# ---------- optional config file ----------
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/custom-fetch/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  while IFS='=' read -r k v; do
+    k="$(printf '%s' "$k" | tr -d '[:space:]')"; v="$(printf '%s' "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ "$k" =~ ^#.*$ || -z "$k" ]] && continue
+    case "$k" in
+      IMAGE) [[ -z "$IMAGE" ]] && IMAGE="$v" ;;
+      WIDTH) [[ "$WIDTH" == "40" ]] && WIDTH="$v" ;;
+      MODE) [[ "$MODE" == "half" ]] && MODE="$v" ;;
+      CHARSET) [[ "$CHARSET" == ' .:-=+*#%@' ]] && CHARSET="$v" ;;
+      COLOR) [[ "$COLOR" == "on" ]] && COLOR="$v" ;;
+    esac
+  done < "$CONFIG_FILE"
+fi
+
+# ---------- validation ----------
+case "$MODE" in half|full|ascii|mono) ;; *) die "invalid --mode: $MODE (half|full|ascii|mono)" ;; esac
+[[ "$MODE" == "mono" ]] && COLOR="off"
+if [[ "${NO_COLOR:-}" != "" ]]; then COLOR="off"; fi
+if ! [[ "$WIDTH" =~ ^[0-9]+$ ]] || ((WIDTH < 10 || WIDTH > 200)); then die "invalid --width: $WIDTH (10-200)"; fi
+if [[ "$COLOR" != "on" && "$COLOR" != "off" ]]; then die "invalid --color: $COLOR (on|off)"; fi
+if [[ "$COLOR" == "off" ]]; then BOLD=""; RESET=""; C_TITLE=""; C_LABEL=""; C_INFO=""; C_SEP=""; fi
+
+# directory as image source -> pick first image
+if [[ -n "$IMAGE" && -d "$IMAGE" ]]; then
+  pick="$(find "$IMAGE" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' -o -iname '*.bmp' \) 2>/dev/null | sort | head -n1)"
+  [[ -n "$pick" ]] && IMAGE="$pick" || die "no images found in directory: $IMAGE"
+fi
+if [[ -n "$IMAGE" ]]; then
+  # expand ~ and resolve
+  IMAGE="${IMAGE/#\~/$HOME}"
+  [[ -f "$IMAGE" ]] || die "image not found: $IMAGE"
+fi
+
+# =====================================================================
+# SYSTEM INFO (fast, pure bash + std tools)
+# =====================================================================
+get_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release; printf '%s' "${PRETTY_NAME:-$NAME}"
+  else uname -s; fi
+}
+get_kernel() { uname -r; }
+get_arch() { uname -m; }
+get_uptime() {
+  if [[ -r /proc/uptime ]]; then
+    local s; s="$(cut -d. -f1 /proc/uptime)"
+    local d=$((s/86400)) h=$(((s%86400)/3600)) m=$(((s%3600)/60))
+    ((d>0)) && printf '%dd ' "$d"; ((h>0)) && printf '%dh ' "$h"; printf '%dm' "$m"
+  else uptime -p 2>/dev/null | sed 's/^up //' || printf 'unknown'; fi
+}
+get_shell() {
+  local sh="${SHELL:-}"; sh="${sh##*/}"
+  [[ -z "$sh" ]] && sh="unknown"
+  if [[ "$sh" == "bash" && -n "${BASH_VERSION:-}" ]]; then
+    printf 'bash %s' "${BASH_VERSION%%(*}"
+  else
+    printf '%s' "$sh"
+  fi
+}
+get_de_wm() {
+  printf '%s' "${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-${XDG_SESSION_DESKTOP:-unknown}}}"
+}
+get_term() { printf '%s' "${TERM_PROGRAM:-${TERMINAL:-${TERM:-unknown}}}"; }
+get_cpu() {
+  local m
+  if [[ -r /proc/cpuinfo ]]; then
+    m="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
+    printf '%s (%s cores)' "${m:-unknown}" "$(nproc 2>/dev/null || printf '?')"
+  else printf '%s' "$(uname -m)"; fi
+}
+get_gpu() {
+  if have lspci; then
+    lspci 2>/dev/null | grep -im1 -E 'vga|3d|display' | cut -d: -f3 | sed 's/^ *//' | cut -c1-60
+  else printf 'unknown'; fi
+}
+get_mem() {
+  if [[ -r /proc/meminfo ]]; then
+    local t a; t="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"; a="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+    printf '%dMiB / %dMiB' "$(((t-a)/1024))" "$((t/1024))"
+  elif have free; then free -m | awk '/Mem:/ {printf "%dMiB / %dMiB", $3, $2}'; else printf 'unknown'; fi
+}
+get_disk() {
+  df -h / 2>/dev/null | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}' || printf 'unknown'
+}
+get_pkgs() {
+  local n=""
+  if have pacman; then n="$(pacman -Qq 2>/dev/null | wc -l) (pacman)"
+  elif have dpkg-query; then n="$(dpkg-query -f '.\n' -W 2>/dev/null | wc -l) (dpkg)"
+  elif have rpm; then n="$(rpm -qa 2>/dev/null | wc -l) (rpm)"
+  elif have apk; then n="$(apk info 2>/dev/null | wc -l) (apk)"
+  elif have xbps-query; then n="$(xbps-query -l 2>/dev/null | wc -l) (xbps)"
+  elif have emerge; then n="$(ls -d /var/db/pkg/*/* 2>/dev/null | wc -l) (portage)"
+  elif have nix-store; then n="$(nix-store -q --requisites /run/current-system/sw 2>/dev/null | wc -l) (nix)"
+  else n="unknown"; fi
+  printf '%s' "$n"
+}
+get_host() {
+  local h=""; h="$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || cat /sys/firmware/devicetree/base/model 2>/dev/null || printf '')"
+  printf '%s' "${h:-$(uname -n)}" | tr -d '\0' | cut -c1-60
+}
+
+build_info_lines() {
+  local user host os sep
+  user="$(whoami 2>/dev/null || printf '%s' "$USER")"; host="$(uname -n 2>/dev/null || hostname 2>/dev/null || printf '?')"
+  os="$(get_os)"
+  sep="$(printf '%*s' "$((${#user}+${#host}+1))" '' | tr ' ' '-')"
+  INFO_LINES=(
+    "${C_TITLE}${BOLD}${user}@${host}${RESET}"
+    "${C_SEP}${sep}${RESET}"
+    "${C_LABEL}OS:${RESET} ${C_INFO}${os} $(get_arch)${RESET}"
+    "${C_LABEL}Host:${RESET} ${C_INFO}$(get_host)${RESET}"
+    "${C_LABEL}Kernel:${RESET} ${C_INFO}$(get_kernel)${RESET}"
+    "${C_LABEL}Uptime:${RESET} ${C_INFO}$(get_uptime)${RESET}"
+    "${C_LABEL}Shell:${RESET} ${C_INFO}$(get_shell)${RESET}"
+    "${C_LABEL}DE:${RESET} ${C_INFO}$(get_de_wm)${RESET}"
+    "${C_LABEL}Terminal:${RESET} ${C_INFO}$(get_term)${RESET}"
+    "${C_LABEL}CPU:${RESET} ${C_INFO}$(get_cpu)${RESET}"
+    "${C_LABEL}GPU:${RESET} ${C_INFO}$(get_gpu)${RESET}"
+    "${C_LABEL}Memory:${RESET} ${C_INFO}$(get_mem)${RESET}"
+    "${C_LABEL}Disk (/):${RESET} ${C_INFO}$(get_disk)${RESET}"
+    "${C_LABEL}Packages:${RESET} ${C_INFO}$(get_pkgs)${RESET}"
+    ""
+    "$(palette_line)"
+  )
+}
+palette_line() {
+  if [[ "$COLOR" == "off" ]]; then printf ''; return; fi
+  local s="" i
+  for i in 0 1 2 3 4 5 6 7; do s="${s}$(printf '\e[4%dm   ' "$i")"; done
+  s="${s}$(printf '\e[0m')"
+  printf '%s' "$s"
+}
+
+# =====================================================================
+# BUILT-IN TEXT LOGOS (fallback when no image)
+# =====================================================================
+get_text_logo() {
+  local name="$1"; name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  local c="$C_TITLE" r="$RESET"
+  case "$name" in
+    arch|archlinux)
+      printf '%s\n' \
+"${c}       /\#\#################,${r}" \
+"${c}      /###################,${r}" \
+"${c}     /####/${r}........${c}####/${r}" \
+"${c}    /####/${r}..........${c}###/${r}" \
+"${c}   /####/${r}.....${c}/####${r}..${c}#/${r}" \
+"${c}  /####/${r}....${c}/######${r}...${c}/${r}" \
+"${c} /####/${r}...${c}/########${r}....${r}" \
+"${c}/#####${r}..${c}/##########${r}.....${r}" \
+"${c}#####################${r}" \
+"${c}####################${r}" ;;
+    ubuntu)
+      printf '%s\n' \
+"${c}            .-/+oossssoo+/-.${r}" \
+"${c}        \`:+ssssssssssssssssss+:\`${r}" \
+"${c}      -+ssssssssssssssssssyyssss+-${r}" \
+"${c}    .ossssssssssssssssssdMMMNysssso.${r}" \
+"${c}   /ssssssssssshdmmNNmmyNMMMMhssssss/${r}" \
+"${c}  +ssssssssshmydMMMMMMMNddddyssssssss+${r}" \
+"${c} /sssssssshNMMMyhhyyyyhmNMMMNhssssssss/${r}" \
+"${c} .ssssssssdMMMNhsssssssssshNMMMdssssssss.${r}" \
+"${c} +sssshhhyNMMNyssssssssssssyNMMMysssssss+${r}" \
+"${c} ossyNMMMNyMMhsssssssssssssshmmmhssssssso${r}" ;;
+    debian)
+      printf '%s\n' \
+"${c}       _,met\$\$\$\$\$gg.${r}" \
+"${c}    ,g\$\$\$\$\$\$\$\$\$\$\$\$\$\$P.${r}" \
+"${c}  ,g\$\$P\"     \"\"\"Y\$.\" ${r}" \
+"${c} ,\$P'              \`.${r}" \
+"${c},\$P       ,ggs.     \`,\$b:${r}" \
+"${c}\$b:      ,\$P\"'   .    \$\$b:${r}" \
+"${c}\$b:     ,\$P'       .    \$\$b:${r}" \
+"${c} \$b.   ,\$P       .     \`\$\$b.${r}" \
+"${c}  Y\$b.\`\"'  _.      .   \`\$b.${r}" \
+"${c}   Y\$\$b.__.\"\" .,._.     .\$P'${r}" ;;
+    fedora)
+      printf '%s\n' \
+"${c}        ,'''''.${r}" \
+"${c}       |   ,.  |       ${r}" \
+"${c}       |  |  '_'${r}" \
+"${c}  ,....|  | ,'\`${r}" \
+"${c} |    |  | |${r}" \
+"${c} |    \`._,'  ,---.${r}" \
+"${c}  \`.         |   |${r}" \
+"${c}    \`.      .'   |${r}" \
+"${c}      \`'---'    .'${r}" \
+"${c}              .'${r}" ;;
+    manjaro)
+      printf '%s\n' \
+"${c}██████████████████  ████████${r}" \
+"${c}██████████████████  ████████${r}" \
+"${c}██████████████████  ████████${r}" \
+"${c}██████████████████  ████████${r}" \
+"${c}████████            ████████${r}" \
+"${c}████████  ████████  ████████${r}" \
+"${c}████████  ████████  ████████${r}" \
+"${c}████████  ████████  ████████${r}" ;;
+    mint|linuxmint)
+      printf '%s\n' \
+"${c} ________  ___${r}" \
+"${c}|\$__   __||   |${r}" \
+"${c}   | |   | |  |${r}" \
+"${c}   | |   | .  |${r}" \
+"${c}   | |   | |\\  |${r}" \
+"${c}   |_|   |_| \\_|${r}" \
+"${c}  Linux Mint${r}" ;;
+    pop|pop_os|pop!_os)
+      printf '%s\n' \
+"${c}______${r}" \
+"${c}| ___ \\${r}" \
+"${c}| |_/ /__  _ __${r}" \
+"${c}|  __/ _ \\| '_ \\${r}" \
+"${c}| | | (_) | |_) |${r}" \
+"${c}\\_|  \\___/| .__/${r}" \
+"${c}          | |${r}" \
+"${c}          |_|${r}" ;;
+    alpine)
+      printf '%s\n' \
+"${c}       /\\${r}" \
+"${c}      /  \\${r}" \
+"${c}     / /\\ \\${r}" \
+"${c}    / /  \\ \\${r}" \
+"${c}   / / /\\ \\ \\${r}" \
+"${c}  / / /  \\ \\ \\${r}" \
+"${c} /_/ /    \\_\\ \\${r}" ;;
+    gentoo)
+      printf '%s\n' \
+"${c}   _-----_ ${r}" \
+"${c}  (       \\\\${r}" \
+"${c}  \\    0   \\${r}" \
+"${c}   \\        )${r}" \
+"${c}   /      _/${r}" \
+"${c}  (     _-${r}" \
+"${c}  \\____-${r}" ;;
+    nix|nixos)
+      printf '%s\n' \
+"${c}  \\\\  \\\\ //${r}" \
+"${c} ==\\\\__\\\\/ //${r}" \
+"${c}   //   \\\\// ==${r}" \
+"${c}==//     //==${r}" \
+"${c} //\\\\___//${r}" \
+"${c}// /\\\\  \\\\==${r}" \
+"${c}  // \\\\ \\\\://${r}" ;;
+    void)
+      printf '%s\n' \
+"${c}    _______${r}" \
+"${c} _ \\______ -${r}" \
+"${c}| \\  ___  \\ |${r}" \
+"${c}| | /   \\ | |${r}" \
+"${c}| | \\___/ | |${r}" \
+"${c}| \\______ \\_|${r}" \
+"${c} -_______\\${r}" ;;
+    *) # generic linux / tux-ish
+      printf '%s\n' \
+"${c}       ___${r}" \
+"${c}      (.. |${r}" \
+"${c}      (<> |${r}" \
+"${c}     //  \\\\${r}" \
+"${c}    //    \\\\${r}" \
+"${c}   ||      |${r}" \
+"${c}  /\\      /\\${r}" \
+"${c} (__)_  (___)${r}" ;;
+  esac
+}
+detect_distro_logo() {
+  local id="generic"
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release; id="${ID:-generic}"
+  fi
+  printf '%s' "$id"
+}
+
+# =====================================================================
+# IMAGE → ASCII (embedded python, multi-backend)
+# =====================================================================
+render_image_pil() {
+  # args: file width mode charset color(on/off)
+  local file="$1" w="$2" mode="$3" cs="$4" col="$5"
+  python3 - "$file" "$w" "$mode" "$cs" "$col" <<'PYEOF'
+import sys
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit(10)
+path, w, mode, charset, col = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+use_color = (col == "on")
+im = Image.open(path)
+# composite transparency onto black
+if im.mode in ("RGBA", "LA"):
+    bg = Image.new("RGB", im.size, (0, 0, 0))
+    bg.paste(im.convert("RGB") if im.mode=="RGBA" else im.convert("RGB"), mask=im.split()[-1])
+    im = bg
+else:
+    im = im.convert("RGB")
+ow, oh = im.size
+if ow <= 0 or oh <= 0:
+    sys.exit(2)
+if mode == "half":
+    pw = w
+    ph = max(1, round(w * oh / ow))
+    im = im.resize((pw, ph), Image.LANCZOS)
+    px = im.load()
+    for y in range(0, ph, 2):
+        line = []
+        for x in range(pw):
+            r1,g1,b1 = px[x, y]
+            if y+1 < ph:
+                r2,g2,b2 = px[x, y+1]
+            else:
+                r2,g2,b2 = (0,0,0)
+            if use_color:
+                line.append(f"\x1b[38;2;{r1};{g1};{b1};48;2;{r2};{g2};{b2}m\u2580\x1b[0m")
+            else:
+                l1 = 0.2126*r1+0.7152*g1+0.0722*b1
+                l2 = 0.2126*r2+0.7152*g2+0.0722*b2
+                t1, t2 = l1>128, l2>128
+                if t1 and t2: ch="\u2588"
+                elif t1: ch="\u2580"
+                elif t2: ch="\u2584"
+                else: ch=" "
+                line.append(ch)
+        print("".join(line))
+elif mode == "full":
+    pw = w
+    ph = max(1, round(w * oh / ow * 0.5))
+    im = im.resize((pw, ph), Image.LANCZOS)
+    px = im.load()
+    for y in range(ph):
+        line=[]
+        for x in range(pw):
+            r,g,b = px[x,y]
+            if use_color:
+                line.append(f"\x1b[38;2;{r};{g};{b}m\u2588\x1b[0m")
+            else:
+                lum = 0.2126*r+0.7152*g+0.0722*b
+                idx = int(lum/255*(len(charset)-1))
+                line.append(charset[idx])
+        print("".join(line))
+else:  # ascii / mono
+    pw = w
+    ph = max(1, round(w * oh / ow * 0.5))
+    im = im.resize((pw, ph), Image.LANCZOS)
+    px = im.load()
+    n = len(charset)
+    for y in range(ph):
+        line=[]
+        for x in range(pw):
+            r,g,b = px[x,y]
+            lum = 0.2126*r+0.7152*g+0.0722*b
+            idx = int(lum/255*(n-1))
+            ch = charset[idx]
+            if use_color:
+                line.append(f"\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m")
+            else:
+                line.append(ch)
+        print("".join(line))
+PYEOF
+}
+
+# stdlib renderer: reads PPM (P6) from a file, scales + renders. No Pillow needed.
+# (takes a file path — not stdin — because the python code itself arrives via heredoc stdin)
+render_ppm_file() {
+  # args: ppmfile width mode charset color
+  local ppmfile="$1" w="$2" mode="$3" cs="$4" col="$5"
+  python3 - "$ppmfile" "$w" "$mode" "$cs" "$col" <<'PYEOF'
+import sys
+ppmpath, w, mode, charset, col = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+use_color = (col == "on")
+with open(ppmpath, 'rb') as f:
+    data = f.read()
+# --- parse P6 PPM ---
+def parse_ppm(d):
+    # returns (W,H,pixels list of rows of (r,g,b))
+    i = 0
+    n = len(d)
+    def next_token():
+        nonlocal i
+        while i < n:
+            if d[i:i+1] == b'#':
+                while i < n and d[i:i+1] != b'\n': i += 1
+                continue
+            if chr(d[i]) in ' \t\n\r':
+                i += 1; continue
+            break
+        j = i
+        while j < n and chr(d[j]) not in ' \t\n\r': j += 1
+        tok = d[i:j].decode('ascii'); i = j
+        return tok
+    magic = next_token()
+    if magic not in ('P6',):
+        print(f"fetch: unsupported pipe format {magic}", file=sys.stderr); sys.exit(3)
+    W = int(next_token()); H = int(next_token()); mx = int(next_token())
+    i += 1  # single whitespace after maxval
+    if mx != 255:
+        print("fetch: only maxval 255 supported", file=sys.stderr); sys.exit(3)
+    need = W*H*3
+    raw = d[i:i+need]
+    if len(raw) < need:
+        print("fetch: truncated image data", file=sys.stderr); sys.exit(3)
+    rows = []
+    p = 0
+    for y in range(H):
+        row = []
+        for x in range(W):
+            row.append((raw[p], raw[p+1], raw[p+2])); p += 3
+        rows.append(row)
+    return W, H, rows
+ow, oh, rows = parse_ppm(data)
+def scale_nearest(rows, ow, oh, pw, ph):
+    out = []
+    for y in range(ph):
+        sy = min(oh-1, int(y*oh/ph))
+        orow = rows[sy]
+        nrow = []
+        for x in range(pw):
+            sx = min(ow-1, int(x*ow/pw))
+            nrow.append(orow[sx])
+        out.append(nrow)
+    return out
+if mode == "half":
+    pw = w; ph = max(1, round(w*oh/ow))
+    px = scale_nearest(rows, ow, oh, pw, ph)
+    for y in range(0, ph, 2):
+        line=[]
+        for x in range(pw):
+            r1,g1,b1 = px[y][x]
+            r2,g2,b2 = px[y+1][x] if y+1<ph else (0,0,0)
+            if use_color:
+                line.append(f"\x1b[38;2;{r1};{g1};{b1};48;2;{r2};{g2};{b2}m\u2580\x1b[0m")
+            else:
+                l1=0.2126*r1+0.7152*g1+0.0722*b1; l2=0.2126*r2+0.7152*g2+0.0722*b2
+                t1,t2 = l1>128, l2>128
+                ch = "\u2588" if (t1 and t2) else ("\u2580" if t1 else ("\u2584" if t2 else " "))
+                line.append(ch)
+        print("".join(line))
+elif mode == "full":
+    pw=w; ph=max(1, round(w*oh/ow*0.5))
+    px=scale_nearest(rows,ow,oh,pw,ph)
+    for y in range(ph):
+        line=[]
+        for x in range(pw):
+            r,g,b=px[y][x]
+            if use_color: line.append(f"\x1b[38;2;{r};{g};{b}m\u2588\x1b[0m")
+            else:
+                lum=0.2126*r+0.7152*g+0.0722*b
+                line.append(charset[int(lum/255*(len(charset)-1))])
+        print("".join(line))
+else:
+    pw=w; ph=max(1, round(w*oh/ow*0.5))
+    px=scale_nearest(rows,ow,oh,pw,ph)
+    n=len(charset)
+    for y in range(ph):
+        line=[]
+        for x in range(pw):
+            r,g,b=px[y][x]
+            lum=0.2126*r+0.7152*g+0.0722*b
+            ch=charset[int(lum/255*(n-1))]
+            if use_color: line.append(f"\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m")
+            else: line.append(ch)
+        print("".join(line))
+PYEOF
+}
+
+# pure-stdlib PNG decoder (no Pillow, no convert/ffmpeg). Handles 8-bit
+# non-interlaced RGB/RGBA/palette/gray. Writes ascii to stdout.
+render_png_stdlib() {
+  local file="$1" w="$2" mode="$3" cs="$4" col="$5"
+  python3 - "$file" "$w" "$mode" "$cs" "$col" <<'PYEOF'
+import sys, struct, zlib
+path, w, mode, charset, col = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+use_color = (col == "on")
+def paeth(a,b,c):
+    p=a+b-c; pa,pb,pc=abs(p-a),abs(p-b),abs(p-c)
+    if pa<=pb and pa<=pc: return a
+    if pb<=pc: return b
+    return c
+with open(path,'rb') as f:
+    sig=f.read(8)
+    if sig!=b'\x89PNG\r\n\x1a\n':
+        print("fetch: not a PNG file", file=sys.stderr); sys.exit(4)
+    ihdr=None; plte=None; idat=b''; trns=None
+    while True:
+        h=f.read(8)
+        if len(h)<8: break
+        ln,typ=struct.unpack('>I4s',h)
+        data=f.read(ln); crc=f.read(4)
+        if typ==b'IHDR': ihdr=data
+        elif typ==b'PLTE': plte=data
+        elif typ==b'IDAT': idat+=data
+        elif typ==b'tRNS': trns=data
+        elif typ==b'IEND': break
+    if ihdr is None: print("fetch: broken PNG", file=sys.stderr); sys.exit(4)
+    W,H,bd,ct,comp,filt,inter=struct.unpack('>IIBBBBB',ihdr)
+    if inter!=0: print("fetch: interlaced PNG not supported (install Pillow/Imagemagick)", file=sys.stderr); sys.exit(4)
+    if bd!=8: print("fetch: only 8-bit PNG supported without Pillow", file=sys.stderr); sys.exit(4)
+    if ct not in (0,2,3,6): print(f"fetch: PNG color type {ct} needs Pillow/Imagemagick", file=sys.stderr); sys.exit(4)
+    chmap={0:1,2:3,3:1,6:4}
+    ch=chmap[ct]; stride=W*ch
+    raw=zlib.decompress(idat)
+    rows=[]; prev=bytearray(stride); pos=0
+    for y in range(H):
+        ftyp=raw[pos]; pos+=1
+        cur=bytearray(raw[pos:pos+stride]); pos+=stride
+        recon=bytearray(stride)
+        if ct in (0,3): bpp=1
+        elif ct==2: bpp=3
+        else: bpp=4
+        for i in range(stride):
+            a=recon[i-bpp] if i>=bpp else 0
+            b=prev[i]; c=prev[i-bpp] if i>=bpp else 0
+            if ftyp==0: v=cur[i]
+            elif ftyp==1: v=(cur[i]+a)&255
+            elif ftyp==2: v=(cur[i]+b)&255
+            elif ftyp==3: v=(cur[i]+((a+b)//2))&255
+            elif ftyp==4: v=(cur[i]+paeth(a,b,c))&255
+            else: print("fetch: bad PNG filter", file=sys.stderr); sys.exit(4)
+            recon[i]=v
+        rows.append(bytes(recon)); prev=recon
+    # to RGB
+    rgb=[]
+    pal=[(plte[i],plte[i+1],plte[i+2]) for i in range(0,len(plte or b''),3)] if plte else []
+    for y in range(H):
+        r=rows[y]; orow=[]
+        if ct==2:
+            for x in range(W): orow.append((r[x*3],r[x*3+1],r[x*3+2]))
+        elif ct==6:
+            for x in range(W):
+                a=r[x*4+3]/255.0
+                orow.append((int(r[x*4]*a),int(r[x*4+1]*a),int(r[x*4+2]*a)))
+        elif ct==0:
+            for x in range(W): orow.append((r[x],r[x],r[x]))
+        elif ct==3:
+            for x in range(W):
+                idx=r[x]
+                orow.append(pal[idx] if idx<len(pal) else (0,0,0))
+        rgb.append(orow)
+    ow,oh=W,H
+    def scale(rows,ow,oh,pw,ph):
+        out=[]
+        for y in range(ph):
+            sy=min(oh-1,int(y*oh/ph)); orow=rows[sy]; nrow=[]
+            for x in range(pw):
+                sx=min(ow-1,int(x*ow/pw)); nrow.append(orow[sx])
+            out.append(nrow)
+        return out
+    if mode=="half":
+        pw=w; ph=max(1,round(w*oh/ow)); px=scale(rgb,ow,oh,pw,ph)
+        for y in range(0,ph,2):
+            line=[]
+            for x in range(pw):
+                r1,g1,b1=px[y][x]; r2,g2,b2=px[y+1][x] if y+1<ph else (0,0,0)
+                if use_color: line.append(f"\x1b[38;2;{r1};{g1};{b1};48;2;{r2};{g2};{b2}m\u2580\x1b[0m")
+                else:
+                    l1=0.2126*r1+0.7152*g1+0.0722*b1; l2=0.2126*r2+0.7152*g2+0.0722*b2
+                    t1,t2=l1>128,l2>128
+                    line.append("\u2588" if (t1 and t2) else ("\u2580" if t1 else ("\u2584" if t2 else " ")))
+            print("".join(line))
+    elif mode=="full":
+        pw=w; ph=max(1,round(w*oh/ow*0.5)); px=scale(rgb,ow,oh,pw,ph)
+        for y in range(ph):
+            line=[]
+            for x in range(pw):
+                r,g,b=px[y][x]
+                if use_color: line.append(f"\x1b[38;2;{r};{g};{b}m\u2588\x1b[0m")
+                else: line.append(charset[int((0.2126*r+0.7152*g+0.0722*b)/255*(len(charset)-1))])
+            print("".join(line))
+    else:
+        pw=w; ph=max(1,round(w*oh/ow*0.5)); px=scale(rgb,ow,oh,pw,ph)
+        n=len(charset)
+        for y in range(ph):
+            line=[]
+            for x in range(pw):
+                r,g,b=px[y][x]
+                ch2=charset[int((0.2126*r+0.7152*g+0.0722*b)/255*(n-1))]
+                if use_color: line.append(f"\x1b[38;2;{r};{g};{b}m{ch2}\x1b[0m")
+                else: line.append(ch2)
+            print("".join(line))
+PYEOF
+}
+
+# main dispatcher: prints ascii art to stdout, returns 0 on success
+print_image_ascii() {
+  local file="$1"
+  local ext="${file##*.}"; ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+  local col="$COLOR"; [[ "$MODE" == "mono" ]] && col="off"
+
+  # 1) Pillow — best path, all formats
+  if have python3 && python_has_pil; then
+    if render_image_pil "$file" "$WIDTH" "$MODE" "$CHARSET" "$col"; then return 0; fi
+    rc=$?; [[ $rc -eq 10 ]] || return $rc   # real render error: don't silently fall through
+  fi
+
+  # 2) ImageMagick / ffmpeg -> PPM file -> stdlib renderer (handles JPG+PNG, no Pillow)
+  if have python3; then
+    local _ppm=""; _ppm="$(mktemp --suffix=.ppm 2>/dev/null || mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$_ppm'" RETURN
+    if have magick; then
+      if magick "$file" -resize '320x320>' "ppm:$_ppm" 2>/dev/null && render_ppm_file "$_ppm" "$WIDTH" "$MODE" "$CHARSET" "$col"; then rm -f "$_ppm"; trap - RETURN; return 0; fi
+    elif have convert; then
+      # cap source at 320px to keep things fast; stdlib python rescales to WIDTH
+      if convert "$file" -resize '320x320>' "ppm:$_ppm" 2>/dev/null && render_ppm_file "$_ppm" "$WIDTH" "$MODE" "$CHARSET" "$col"; then rm -f "$_ppm"; trap - RETURN; return 0; fi
+    fi
+    if have ffmpeg; then
+      if ffmpeg -y -loglevel error -i "$file" -vframes 1 -vf "scale='min(320\,iw)':-1" -f image2 -vcodec ppm "$_ppm" 2>/dev/null && render_ppm_file "$_ppm" "$WIDTH" "$MODE" "$CHARSET" "$col"; then rm -f "$_ppm"; trap - RETURN; return 0; fi
+    fi
+    rm -f "$_ppm"; trap - RETURN
+  fi
+
+  # 3) pure-stdlib PNG (zero deps)
+  if [[ "$ext" == "png" ]] && have python3; then
+    if render_png_stdlib "$file" "$WIDTH" "$MODE" "$CHARSET" "$col"; then return 0; fi
+    return $?
+  fi
+
+  # 4) external ascii tools as last resort
+  if have chafa; then
+    local args=(--format symbols --symbols block --size "${WIDTH}x")
+    [[ "$col" == "off" ]] && args+=(--color-space mono)
+    chafa "${args[@]}" "$file" 2>/dev/null && return 0
+  fi
+  if have jp2a; then
+    [[ "$col" == "off" ]] && jp2a --width="$WIDTH" "$file" 2>/dev/null && return 0
+    jp2a --colors --width="$WIDTH" "$file" 2>/dev/null && return 0
+  fi
+
+  die "cannot decode '$file'. Install one of: python3-pillow, imagemagick, ffmpeg."
+}
+
+# =====================================================================
+# MAIN RENDER
+# =====================================================================
+main() {
+  local -a ART=()
+  local art_width="$WIDTH"
+
+  if [[ -n "$IMAGE" && "$SHOW_INFO" != "off" || -n "$IMAGE" ]]; then :; fi
+
+  if [[ -n "$IMAGE" ]]; then
+    # capture rendered lines preserving ANSI
+    tmp="$(mktemp)"
+    if ! print_image_ascii "$IMAGE" > "$tmp"; then rm -f "$tmp"; exit 1; fi
+    mapfile -t ART < "$tmp"
+    rm -f "$tmp"
+    art_width="$WIDTH"
+  elif [[ -n "$TEXT_LOGO" && "$TEXT_LOGO" != "__none__" ]]; then
+    tmp="$(mktemp)"
+    get_text_logo "$TEXT_LOGO" > "$tmp"
+    mapfile -t ART < "$tmp"
+    rm -f "$tmp"
+    # visible width of text logo = longest line without ANSI
+    art_width=0
+    for l in "${ART[@]}"; do
+      plain="$(printf '%s' "$l" | sed -e 's/\x1b\[[0-9;]*m//g')"
+      (( ${#plain} > art_width )) && art_width=${#plain}
+    done
+  elif [[ "${TEXT_LOGO:-}" == "__none__" ]]; then
+    ART=(); art_width=0
+  else
+    tmp="$(mktemp)"
+    get_text_logo "$(detect_distro_logo)" > "$tmp"
+    mapfile -t ART < "$tmp"
+    rm -f "$tmp"
+    art_width=0
+    for l in "${ART[@]}"; do
+      plain="$(printf '%s' "$l" | sed -e 's/\x1b\[[0-9;]*m//g')"
+      (( ${#plain} > art_width )) && art_width=${#plain}
+    done
+  fi
+
+  if [[ "$SHOW_INFO" == "off" ]]; then
+    printf '%s\n' "${ART[@]}"
+    return 0
+  fi
+
+  build_info_lines
+
+  local n_art=${#ART[@]} n_info=${#INFO_LINES[@]}
+  local n=$(( n_art > n_info ? n_art : n_info ))
+  local gap; gap="$(printf '%*s' "$GAP" '')"
+  local i a inf pad
+  for ((i=0; i<n; i++)); do
+    a=""; inf=""
+    (( i < n_art )) && a="${ART[i]}"
+    (( i < n_info )) && inf="${INFO_LINES[i]}"
+    if (( art_width == 0 )); then
+      printf '%b\n' "$inf"
+    elif [[ -z "$a" ]]; then
+      pad="$(printf '%*s' "$art_width" '')"
+      if [[ -z "$inf" ]]; then printf '\n'; else printf '%s%s%b\n' "$pad" "$gap" "$inf"; fi
+    else
+      if [[ -z "$inf" ]]; then printf '%b\n' "$a"
+      else printf '%b%s%b\n' "$a" "$gap" "$inf"; fi
+    fi
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
