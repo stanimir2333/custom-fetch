@@ -6,6 +6,9 @@
 #   ./fetch --image photo.jpg
 #   ./fetch -i logo.png -w 50 --mode half
 #   ./fetch --image ~/Pictures/wallpaper.jpg --ascii
+#   ./fetch -i anim.gif --animate        # animated GIF/WebP playback (loops)
+#   ./fetch -i anim.gif --once --fps 20  # smoother, same speed, play once
+#   ./fetch -i anim.gif --once --fps 20 --speed 2  # smoother + 2x fast
 #   ./fetch --logo arch            # text logo only (no image)
 #   ./fetch --info-only            # no logo/image
 #
@@ -13,10 +16,11 @@
 #   1) python3 + Pillow (best, handles JPG/PNG/WebP/GIF/BMP, truecolor)
 #   2) ImageMagick (convert/magick) or ffmpeg -> PPM -> stdlib python renderer
 #   3) pure-python stdlib PNG decoder (zero deps, PNG-only)
+# Animated GIF/WebP/APNG play as ANSI animation (Pillow, else ffmpeg).
 # No terminal graphics protocol (kitty/sixel) needed — plain ANSI, works over SSH.
 #
 set -u
-VERSION="1.0.0"
+VERSION="1.3.0"
 
 # ---------- defaults ----------
 IMAGE=""
@@ -27,6 +31,10 @@ COLOR="on"
 SHOW_INFO="on"
 TEXT_LOGO=""         # distro name for text logo fallback
 GAP=4
+ANIMATE="auto"       # auto | on | off  (animated GIF/WebP playback)
+FPS=""               # target smoothness (frames per second, 1-60, same speed via interpolation)
+SPEED=""             # speed multiplier (e.g. 2 = twice as fast, 0.5 = half speed)
+LOOPS="0"            # animation loop count (0 = infinite)
 
 BOLD=$'\e[1m'; RESET=$'\e[0m'
 C_TITLE=$'\e[1;36m'; C_LABEL=$'\e[1;32m'; C_INFO=$'\e[0m'; C_SEP=$'\e[90m'
@@ -35,6 +43,7 @@ C_TITLE=$'\e[1;36m'; C_LABEL=$'\e[1;32m'; C_INFO=$'\e[0m'; C_SEP=$'\e[90m'
 die() { printf 'fetch: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 python_has_pil() { python3 -c 'import PIL.Image' >/dev/null 2>&1; }
+dbg() { if [[ -n "${FETCH_DEBUG:-}" ]]; then printf 'fetch-debug: %s\n' "$*" >&2; fi; return 0; }
 
 usage() {
   cat <<EOF
@@ -55,6 +64,15 @@ Options:
   --mono               shortcut for --mode mono --color off
   --charset STR        custom charset for ascii/mono (default: ' .:-=+*#%@')
   --color on|off       ANSI colors (default: on)
+  --animate            animate GIF/WebP if animated (default when stdout is a TTY)
+  --no-animate, --static
+                       show first frame only (no animation)
+  --fps N              smoothness (1-60 fps, default: native frames).
+                       Higher fps = smoother but SAME speed (interpolated).
+  --speed M            speed multiplier (e.g. 2 = twice as fast, 0.5 = half
+                       speed, default: 1). Combines with --fps.
+  --loops N            animation loop count (0 = infinite, default: 0)
+  --once               shortcut for --loops 1 (play once, then stop)
   --logo NAME          use built-in text logo instead of image (arch, ubuntu,
                        debian, fedora, archlinux, manjaro, mint, pop, alpine, gentoo)
   --list-logos         list built-in text logos
@@ -69,9 +87,13 @@ Examples:
   fetch -i pic.jpg --ascii -w 70
   fetch ~/Pictures/wallpaper.png
   fetch --logo arch
+  fetch -i anim.gif --animate -w 40       # play animated GIF (loops until Ctrl-C)
+  fetch -i anim.gif --once --fps 20       # smoother, same speed, play once
+  fetch -i anim.gif --once --fps 20 --speed 2  # smoother + twice as fast
 
 Config (optional): ~/.config/custom-fetch/config
-  One KEY=VALUE per line: IMAGE=, WIDTH=, MODE=, CHARSET=, COLOR=
+  One KEY=VALUE per line: IMAGE=, WIDTH=, MODE=, CHARSET=, COLOR=,
+                          ANIMATE=, FPS=, SPEED=, LOOPS=
 EOF
 }
 
@@ -95,6 +117,15 @@ while (($#)); do
     --color=*) COLOR="${1#*=}"; shift ;;
     --ascii) MODE="ascii"; shift ;;
     --mono) MODE="mono"; COLOR="off"; shift ;;
+    --animate) ANIMATE="on"; shift ;;
+    --no-animate|--static) ANIMATE="off"; shift ;;
+    --fps) FPS="${2:-}"; shift 2 ;;
+    --fps=*) FPS="${1#*=}"; shift ;;
+    --speed) SPEED="${2:-}"; shift 2 ;;
+    --speed=*) SPEED="${1#*=}"; shift ;;
+    --loops) LOOPS="${2:-}"; shift 2 ;;
+    --loops=*) LOOPS="${1#*=}"; shift ;;
+    --once) LOOPS="1"; shift ;;
     --logo) TEXT_LOGO="${2:-}"; shift 2 ;;
     --logo=*) TEXT_LOGO="${1#*=}"; shift ;;
     --list-logos) list_logos; exit 0 ;;
@@ -123,6 +154,10 @@ if [[ -f "$CONFIG_FILE" ]]; then
       MODE) [[ "$MODE" == "half" ]] && MODE="$v" ;;
       CHARSET) [[ "$CHARSET" == ' .:-=+*#%@' ]] && CHARSET="$v" ;;
       COLOR) [[ "$COLOR" == "on" ]] && COLOR="$v" ;;
+      ANIMATE) [[ "$ANIMATE" == "auto" ]] && ANIMATE="$v" ;;
+      FPS) [[ -z "$FPS" ]] && FPS="$v" ;;
+      SPEED) [[ -z "$SPEED" ]] && SPEED="$v" ;;
+      LOOPS) [[ "$LOOPS" == "0" ]] && LOOPS="$v" ;;
     esac
   done < "$CONFIG_FILE"
 fi
@@ -133,6 +168,16 @@ case "$MODE" in half|full|ascii|mono) ;; *) die "invalid --mode: $MODE (half|ful
 if [[ "${NO_COLOR:-}" != "" ]]; then COLOR="off"; fi
 if ! [[ "$WIDTH" =~ ^[0-9]+$ ]] || ((WIDTH < 10 || WIDTH > 200)); then die "invalid --width: $WIDTH (10-200)"; fi
 if [[ "$COLOR" != "on" && "$COLOR" != "off" ]]; then die "invalid --color: $COLOR (on|off)"; fi
+ANIMATE="$(printf '%s' "$ANIMATE" | tr '[:upper:]' '[:lower:]')"
+case "$ANIMATE" in auto|on|off) ;; *) die "invalid --animate value: $ANIMATE (auto|on|off, or use --animate/--no-animate)" ;; esac
+if [[ -n "$FPS" ]]; then
+  if ! [[ "$FPS" =~ ^[0-9]+$ ]] || ((FPS < 1 || FPS > 60)); then die "invalid --fps: $FPS (1-60)"; fi
+fi
+if [[ -n "$SPEED" ]]; then
+  if ! [[ "$SPEED" =~ ^[0-9]*\.?[0-9]+$ ]]; then die "invalid --speed: $SPEED (e.g. 0.5, 1, 2)"; fi
+  if ! awk -v s="$SPEED" 'BEGIN{exit !(s>=0.2 && s<=5)}'; then die "invalid --speed: $SPEED (range 0.2-5)"; fi
+fi
+if ! [[ "$LOOPS" =~ ^[0-9]+$ ]]; then die "invalid --loops: $LOOPS (>=0, 0=infinite)"; fi
 if [[ "$COLOR" == "off" ]]; then BOLD=""; RESET=""; C_TITLE=""; C_LABEL=""; C_INFO=""; C_SEP=""; fi
 
 # directory as image source -> pick first image
@@ -696,6 +741,689 @@ with open(path,'rb') as f:
 PYEOF
 }
 
+# =====================================================================
+# ANIMATED IMAGES (GIF / animated WebP / APNG → terminal animation)
+# =====================================================================
+# max frames to keep in memory / prerender (sampled evenly if exceeded)
+ANIM_MAX_FRAMES=80
+
+is_animated_image() {
+  local file="$1"
+  if have python3 && python_has_pil; then
+    python3 - "$file" <<'PYEOF'
+import sys
+try:
+    from PIL import Image
+    im = Image.open(sys.argv[1])
+    n = getattr(im, 'n_frames', 1)
+    sys.exit(0 if n > 1 else 1)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(2)
+PYEOF
+    rc=$?
+    if [[ $rc -eq 0 ]]; then return 0; fi
+    if [[ $rc -eq 1 ]]; then return 1; fi
+    # rc==2: PIL couldn't probe, fall through to other detectors
+  fi
+  if have identify; then
+    local n; n="$(identify -format '%n\n' "$file" 2>/dev/null | head -n1)"
+    if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 1)); then return 0; fi
+    [[ "$n" =~ ^[0-9]+$ ]] && return 1
+  fi
+  if have magick; then
+    local n; n="$(magick identify -format '%n\n' "$file" 2>/dev/null | head -n1)"
+    if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 1)); then return 0; fi
+    [[ "$n" =~ ^[0-9]+$ ]] && return 1
+  fi
+  return 1
+}
+
+should_animate() {
+  local file="$1"
+  [[ -n "$file" ]] || { dbg "animate=no (no image)"; return 1; }
+  if [[ "$ANIMATE" == "off" ]]; then dbg "animate=no (ANIMATE=off/--static)"; return 1; fi
+  if [[ "$ANIMATE" == "auto" ]]; then
+    if [[ -t 1 ]]; then dbg "animate check: auto + TTY";
+    else dbg "animate=no (auto + not a TTY; use --animate to force)"; return 1; fi
+  fi
+  # ANIMATE=on forces playback even when piped
+  if is_animated_image "$file"; then dbg "animate=yes ($file animated)"; return 0; else dbg "animate=no ($file single-frame)"; return 1; fi
+}
+
+# Render all frames via Pillow into $outdir/frame_*.txt + durations.txt + count.txt
+# When $FPS_TARGET is set, resamples to that fps preserving total duration
+# via blending (smoother, same speed). Otherwise uses native timing.
+# Returns 0 if animated (2+ frames), 5 if static (single frame), nonzero on error.
+render_animated_pil() {
+  local file="$1" w="$2" mode="$3" cs="$4" col="$5" outdir="$6" fps_target="${7:-}"
+  mkdir -p "$outdir"
+  python3 - "$file" "$w" "$mode" "$cs" "$col" "$outdir" "$ANIM_MAX_FRAMES" "$fps_target" <<'PYEOF'
+import sys, os
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit(10)
+args = sys.argv[1:]
+path = args[0]; w = int(args[1]); mode = args[2]; charset = args[3]
+col = args[4]; outdir = args[5]; maxf = int(args[6])
+fps_s = args[7] if len(args) > 7 else ""
+fps_target = int(fps_s) if fps_s.strip().isdigit() else 0
+INTERP_MAX = 200
+use_color = (col == "on")
+try:
+    im = Image.open(path)
+except Exception as e:
+    print(f"fetch: cannot open image: {e}", file=sys.stderr); sys.exit(2)
+n = getattr(im, 'n_frames', 1)
+if n <= 1:
+    sys.exit(5)
+ow, oh = im.size
+if ow <= 0 or oh <= 0:
+    sys.exit(2)
+if mode == "half":
+    pw = w; ph = max(1, round(w * oh / ow))
+else:
+    pw = w; ph = max(1, round(w * oh / ow * 0.5))
+
+def to_rgb(frame):
+    if frame.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", frame.size, (0, 0, 0))
+        bg.paste(frame.convert("RGB"), mask=frame.split()[-1])
+        return bg
+    if "transparency" in frame.info:
+        try:
+            rgba = frame.convert("RGBA")
+            bg = Image.new("RGB", frame.size, (0, 0, 0))
+            bg.paste(rgba.convert("RGB"), mask=rgba.split()[-1])
+            return bg
+        except Exception:
+            return frame.convert("RGB")
+    return frame.convert("RGB")
+
+def render_small(sml):
+    # sml is already pw x ph RGB; emits minimal ANSI (only on color change)
+    px = sml.load()
+    lines = []
+    if mode == "half":
+        for y in range(0, ph, 2):
+            parts = []
+            cur = None
+            for x in range(pw):
+                r1, g1, b1 = px[x, y]
+                if y + 1 < ph:
+                    r2, g2, b2 = px[x, y + 1]
+                else:
+                    r2, g2, b2 = (0, 0, 0)
+                if use_color:
+                    key = (r1, g1, b1, r2, g2, b2)
+                    if key != cur:
+                        parts.append(f"\x1b[38;2;{r1};{g1};{b1};48;2;{r2};{g2};{b2}m")
+                        cur = key
+                    parts.append("\u2580")
+                else:
+                    l1 = 0.2126*r1+0.7152*g1+0.0722*b1
+                    l2 = 0.2126*r2+0.7152*g2+0.0722*b2
+                    t1, t2 = l1 > 128, l2 > 128
+                    if t1 and t2: ch = "\u2588"
+                    elif t1: ch = "\u2580"
+                    elif t2: ch = "\u2584"
+                    else: ch = " "
+                    parts.append(ch)
+            if use_color and cur is not None:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
+    elif mode == "full":
+        for y in range(ph):
+            parts = []
+            cur = None
+            for x in range(pw):
+                r, g, b = px[x, y]
+                if use_color:
+                    key = (r, g, b)
+                    if key != cur:
+                        parts.append(f"\x1b[38;2;{r};{g};{b}m")
+                        cur = key
+                    parts.append("\u2588")
+                else:
+                    lum = 0.2126*r+0.7152*g+0.0722*b
+                    parts.append(charset[int(lum/255*(len(charset)-1))])
+            if use_color and cur is not None:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
+    else:
+        nn = len(charset)
+        for y in range(ph):
+            parts = []
+            cur = None
+            for x in range(pw):
+                r, g, b = px[x, y]
+                lum = 0.2126*r+0.7152*g+0.0722*b
+                ch = charset[int(lum/255*(nn-1))]
+                if use_color:
+                    key = (r, g, b)
+                    if key != cur:
+                        parts.append(f"\x1b[38;2;{r};{g};{b}m")
+                        cur = key
+                    parts.append(ch)
+                else:
+                    parts.append(ch)
+            if use_color and cur is not None:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
+    return lines
+
+def write_frame(idx, sml, dur):
+    lines = render_small(sml)
+    with open(os.path.join(outdir, f"frame_{idx:03d}.txt"), "w", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln + "\n")
+    return str(dur)
+
+# collect natives as small RGB (fast blend + low memory), sequential for disposal
+natives = []
+native_durs = []
+for i in range(n):
+    try:
+        im.seek(i)
+    except EOFError:
+        break
+    dur = im.info.get("duration", 100)
+    try:
+        dur = int(dur)
+    except Exception:
+        dur = 100
+    if dur < 20:
+        dur = 100
+    rgb = to_rgb(im)
+    if rgb.size != (pw, ph):
+        rgb = rgb.resize((pw, ph), Image.LANCZOS)
+    natives.append(rgb)
+    native_durs.append(dur)
+if len(natives) <= 1:
+    sys.exit(5)
+
+if fps_target and fps_target > 0:
+    D = sum(native_durs)
+    if D <= 0:
+        D = len(natives) * 100
+    M = int(round(D * fps_target / 1000))
+    M = max(2, min(INTERP_MAX, M))
+    uni = int(round(D / M))  # preserves total duration even when capped
+    if uni < 1:
+        uni = 1
+    # cumulative timeline
+    cum = [0]
+    for d in native_durs:
+        cum.append(cum[-1] + d)
+    durs = []
+    N = len(natives)
+    # linear scan pointer (N small)
+    for j in range(M):
+        t = j * D / M
+        k = 0
+        # find interval k with cum[k] <= t < cum[k+1]
+        for kk in range(N):
+            if cum[kk] <= t < cum[kk+1]:
+                k = kk
+                break
+            if t >= cum[N]:
+                k = N - 1
+        dk = native_durs[k] if native_durs[k] > 0 else 1
+        alpha = (t - cum[k]) / dk
+        if alpha < 0.02:
+            out = natives[k]
+        elif alpha > 0.98:
+            out = natives[(k + 1) % N]
+        else:
+            a = natives[k]
+            b = natives[(k + 1) % N]
+            if a.size != b.size:
+                b = b.resize(a.size, Image.BILINEAR)
+            try:
+                out = Image.blend(a, b, float(alpha))
+            except Exception:
+                out = a
+        durs.append(write_frame(j, out, uni))
+    count = M
+else:
+    # native timing, sample evenly when too many frames
+    N = len(natives)
+    if N > maxf:
+        step = N / maxf
+        idxs = [int(i * step) for i in range(maxf)]
+        scale = N / maxf
+    else:
+        idxs = list(range(N))
+        scale = 1.0
+    durs = []
+    for c, idx in enumerate(idxs):
+        d = int(round(native_durs[idx] * scale))
+        durs.append(write_frame(c, natives[idx], d))
+    count = len(idxs)
+if count <= 1:
+    sys.exit(5)
+with open(os.path.join(outdir, "durations.txt"), "w") as f:
+    f.write("\n".join(durs) + "\n")
+with open(os.path.join(outdir, "count.txt"), "w") as f:
+    f.write(str(count) + "\n")
+PYEOF
+}
+
+# Fallback frame extraction via ffmpeg (no Pillow): dumps PPMs then renders each.
+# When $FPS_TARGET is set, resamples preserving duration via blending (same speed).
+# Native delays unknown → assumes 100ms each.
+render_animated_ffmpeg() {
+  local file="$1" w="$2" mode="$3" cs="$4" col="$5" outdir="$6" fps_target="${7:-$FPS}"
+  mkdir -p "$outdir"
+  local ppm_tmp="$outdir/ppm"
+  mkdir -p "$ppm_tmp"
+  if ! ffmpeg -y -loglevel error -i "$file" -vf "scale='min(320\,iw)':-1" "$ppm_tmp/f_%03d.ppm" 2>/dev/null; then
+    return 1
+  fi
+  python3 - "$ppm_tmp" "$w" "$mode" "$cs" "$col" "$outdir" "$ANIM_MAX_FRAMES" "$fps_target" <<'PYEOF'
+import sys, os, glob
+ppmdir, w, mode, charset, col, outdir, maxf_s, fps_s = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], (sys.argv[8] if len(sys.argv) > 8 else "")
+maxf = int(maxf_s)
+fps_target = int(fps_s) if fps_s.strip().isdigit() else 0
+INTERP_MAX = 200
+use_color = (col == "on")
+def parse_ppm(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    i = 0; nn = len(data)
+    def next_token():
+        nonlocal i
+        while i < nn:
+            if data[i:i+1] == b'#':
+                while i < nn and data[i:i+1] != b'\n': i += 1
+                continue
+            if chr(data[i]) in ' \t\n\r':
+                i += 1; continue
+            break
+        j = i
+        while j < nn and chr(data[j]) not in ' \t\n\r': j += 1
+        tok = data[i:j].decode('ascii'); i = j
+        return tok
+    magic = next_token()
+    if magic != 'P6':
+        raise ValueError(f"unsupported {magic}")
+    W = int(next_token()); H = int(next_token()); mx = int(next_token())
+    i += 1
+    raw = data[i:i+W*H*3]
+    rows = []
+    p = 0
+    for y in range(H):
+        row = []
+        for x in range(W):
+            row.append((raw[p], raw[p+1], raw[p+2])); p += 3
+        rows.append(row)
+    return W, H, rows
+def scale_nearest(rows, ow, oh, pw, ph):
+    out = []
+    for y in range(ph):
+        sy = min(oh-1, int(y*oh/ph)); orow = rows[sy]; nrow = []
+        for x in range(pw):
+            sx = min(ow-1, int(x*ow/pw)); nrow.append(orow[sx])
+        out.append(nrow)
+    return out
+def render_small(px, pw, ph):
+    lines = []
+    if mode == "half":
+        for y in range(0, ph, 2):
+            parts = []
+            cur = None
+            for x in range(pw):
+                r1,g1,b1 = px[y][x]
+                r2,g2,b2 = px[y+1][x] if y+1 < ph else (0,0,0)
+                if use_color:
+                    key = (r1,g1,b1,r2,g2,b2)
+                    if key != cur:
+                        parts.append(f"\x1b[38;2;{r1};{g1};{b1};48;2;{r2};{g2};{b2}m")
+                        cur = key
+                    parts.append("\u2580")
+                else:
+                    l1=0.2126*r1+0.7152*g1+0.0722*b1; l2=0.2126*r2+0.7152*g2+0.0722*b2
+                    t1,t2 = l1>128, l2>128
+                    parts.append("\u2588" if (t1 and t2) else ("\u2580" if t1 else ("\u2584" if t2 else " ")))
+            if use_color and cur is not None:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
+    elif mode == "full":
+        for y in range(ph):
+            parts = []
+            cur = None
+            for x in range(pw):
+                r,g,b = px[y][x]
+                if use_color:
+                    key = (r,g,b)
+                    if key != cur:
+                        parts.append(f"\x1b[38;2;{r};{g};{b}m")
+                        cur = key
+                    parts.append("\u2588")
+                else:
+                    parts.append(charset[int((0.2126*r+0.7152*g+0.0722*b)/255*(len(charset)-1))])
+            if use_color and cur is not None:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
+    else:
+        nn2 = len(charset)
+        for y in range(ph):
+            parts = []
+            cur = None
+            for x in range(pw):
+                r,g,b = px[y][x]
+                ch = charset[int((0.2126*r+0.7152*g+0.0722*b)/255*(nn2-1))]
+                if use_color:
+                    key = (r,g,b)
+                    if key != cur:
+                        parts.append(f"\x1b[38;2;{r};{g};{b}m")
+                        cur = key
+                    parts.append(ch)
+                else:
+                    parts.append(ch)
+            if use_color and cur is not None:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
+    return lines
+ppms = sorted(glob.glob(os.path.join(ppmdir, "f_*.ppm")))
+if len(ppms) <= 1:
+    sys.exit(5)
+# use first for dimensions
+ow0, oh0, rows0 = parse_ppm(ppms[0])
+if mode == "half":
+    pw = w; ph = max(1, round(w*oh0/ow0))
+else:
+    pw = w; ph = max(1, round(w*oh0/ow0*0.5))
+smalls = []
+for p in ppms:
+    try:
+        ow, oh, rows = parse_ppm(p)
+    except Exception:
+        continue
+    smalls.append(scale_nearest(rows, ow, oh, pw, ph))
+N = len(smalls)
+if N <= 1:
+    sys.exit(5)
+def write_frame(idx, px, dur):
+    lines = render_small(px, pw, ph)
+    with open(os.path.join(outdir, f"frame_{idx:03d}.txt"), "w", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln + "\n")
+    return str(dur)
+if fps_target and fps_target > 0:
+    D = N * 100
+    M = int(round(D * fps_target / 1000))
+    M = max(2, min(INTERP_MAX, M))
+    uni = int(round(D / M))
+    if uni < 1:
+        uni = 1
+    durs = []
+    for j in range(M):
+        # position in native units (each native = 100ms)
+        pos = j * N / M
+        k = int(pos) % N
+        alpha = pos - int(pos)
+        # snap to sharp when very close
+        if alpha < 0.02:
+            out = smalls[k]
+        elif alpha > 0.98:
+            out = smalls[(k+1) % N]
+        else:
+            a = smalls[k]; b = smalls[(k+1) % N]
+            out = []
+            for y in range(ph):
+                orow = []
+                ar = a[y]; br = b[y]
+                for x in range(pw):
+                    r1,g1,b1 = ar[x]; r2,g2,b2 = br[x]
+                    orow.append((int(r1+(r2-r1)*alpha), int(g1+(g2-g1)*alpha), int(b1+(b2-b1)*alpha)))
+                out.append(orow)
+        durs.append(write_frame(j, out, uni))
+    count = M
+else:
+    if N > maxf:
+        step = N / maxf
+        idxs = [int(i*step) for i in range(maxf)]
+    else:
+        idxs = list(range(N))
+    durs = []
+    for c, idx in enumerate(idxs):
+        durs.append(write_frame(c, smalls[idx], 100))
+    count = len(idxs)
+if count <= 1:
+    sys.exit(5)
+with open(os.path.join(outdir, "durations.txt"), "w") as f:
+    f.write("\n".join(durs) + "\n")
+with open(os.path.join(outdir, "count.txt"), "w") as f:
+    f.write(str(count) + "\n")
+PYEOF
+  rc=$?
+  rm -rf "$ppm_tmp"
+  if [[ $rc -eq 5 ]]; then return 5; fi
+  [[ $rc -eq 0 ]] || return $rc
+  [[ -f "$outdir/count.txt" ]] || return 1
+  return 0
+}
+
+# Full animated playback: prerenders combined (art+info) screens, then loops.
+# Args: image_file. Uses globals WIDTH/MODE/CHARSET/COLOR/SHOW_INFO/GAP/FPS/SPEED/LOOPS.
+run_animated_image() {
+  local file="$1"
+  local col="$COLOR"; [[ "$MODE" == "mono" ]] && col="off"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  local n_frames=0 rendered=0
+  if have python3 && python_has_pil; then
+    if render_animated_pil "$file" "$WIDTH" "$MODE" "$CHARSET" "$col" "$tmpdir" "$FPS"; then
+      n_frames="$(cat "$tmpdir/count.txt")"; rendered=1
+    else
+      rc=$?
+      if [[ $rc -eq 5 ]]; then rm -rf "$tmpdir"; return 5; fi  # static
+      # fall through to ffmpeg attempt on other errors
+    fi
+  fi
+  if (( rendered == 0 )); then
+    if have ffmpeg && have python3; then
+      if render_animated_ffmpeg "$file" "$WIDTH" "$MODE" "$CHARSET" "$col" "$tmpdir" "$FPS"; then
+        n_frames="$(cat "$tmpdir/count.txt")"; rendered=1
+      else
+        rc=$?
+        rm -rf "$tmpdir"
+        if [[ $rc -eq 5 ]]; then return 5; fi
+        return $rc
+      fi
+    else
+      rm -rf "$tmpdir"; return 5
+    fi
+  fi
+  if (( n_frames <= 1 )); then rm -rf "$tmpdir"; return 5; fi
+  dbg "animated render: $n_frames frames (fps=${FPS:-native} speed=${SPEED:-1})"
+
+  # frame delays (ms) → microseconds int for drift-free pacing.
+  # Durations already preserve total speed (FPS resamples via interpolation).
+  # --speed scales them (2 = twice as fast).
+  local speed="${SPEED:-1}"
+  local -a DELAY_US=()
+  # single awk for all frames (1 fork, not N): clamp tiny native delays, apply speed, min 10ms
+  if [[ -z "$FPS" ]]; then
+    mapfile -t DELAY_US < <(awk -v s="$speed" '{m=$1+0; if(m==""||m<=0)m=100; if(m<20)m=100; d=m*1000/s; if(d<10000)d=10000; printf "%d\n", d}' "$tmpdir/durations.txt")
+  else
+    mapfile -t DELAY_US < <(awk -v s="$speed" '{m=$1+0; if(m==""||m<=0)m=100; d=m*1000/s; if(d<10000)d=10000; printf "%d\n", d}' "$tmpdir/durations.txt")
+  fi
+
+  # static side info (if any)
+  local -a INFO=()
+  local n_info=0
+  if [[ "$SHOW_INFO" != "off" ]]; then
+    build_info_lines
+    INFO=("${INFO_LINES[@]}")
+    n_info=${#INFO[@]}
+  fi
+
+  # prerender combined screens then load to memory (zero forks per frame in loop)
+  local screens_dir="$tmpdir/screens"
+  mkdir -p "$screens_dir"
+  local gap; gap="$(printf '%*s' "$GAP" '')"
+  local first_frame; first_frame="$(printf '%s/frame_%03d.txt' "$tmpdir" 0)"
+  local art_h; art_h="$(wc -l < "$first_frame" | tr -d ' ')"
+  local screen_h=0
+  if [[ "$SHOW_INFO" == "off" ]]; then
+    local f
+    for ((f=0; f<n_frames; f++)); do
+      cp "$(printf '%s/frame_%03d.txt' "$tmpdir" "$f")" "$(printf '%s/screen_%03d.txt' "$screens_dir" "$f")"
+    done
+    screen_h="$art_h"
+  else
+    local total=$(( art_h > n_info ? art_h : n_info ))
+    screen_h="$total"
+    local f ii a inf pad
+    for ((f=0; f<n_frames; f++)); do
+      local frame_file; frame_file="$(printf '%s/frame_%03d.txt' "$tmpdir" "$f")"
+      local -a ART_F=()
+      mapfile -t ART_F < "$frame_file"
+      local out; out="$(printf '%s/screen_%03d.txt' "$screens_dir" "$f")"
+      : > "$out"
+      for ((ii=0; ii<total; ii++)); do
+        a=""; inf=""
+        (( ii < art_h )) && a="${ART_F[ii]:-}"
+        (( ii < n_info )) && inf="${INFO[ii]:-}"
+        if (( WIDTH == 0 )); then
+          printf '%b\n' "$inf" >> "$out"
+        elif [[ -z "$a" ]]; then
+          pad="$(printf '%*s' "$WIDTH" '')"
+          if [[ -z "$inf" ]]; then printf '\n' >> "$out"; else printf '%s%s%b\n' "$pad" "$gap" "$inf" >> "$out"; fi
+        else
+          if [[ -z "$inf" ]]; then printf '%b\n' "$a" >> "$out"
+          else printf '%b%s%b\n' "$a" "$gap" "$inf" >> "$out"; fi
+        fi
+      done
+    done
+  fi
+
+  # load all screens to memory: playback then uses only builtins + 1 sleep fork
+  local -a SCREENS=()
+  local f
+  for ((f=0; f<n_frames; f++)); do
+    SCREENS[f]="$(cat "$(printf '%s/screen_%03d.txt' "$screens_dir" "$f")")"
+  done
+
+  local HIDE=$'\e[?25l' SHOW=$'\e[?25h'
+  printf '%s' "$HIDE"
+  # shellcheck disable=SC2064
+  trap "printf '\e[?25h'; rm -rf \"$tmpdir\"; exit 0" INT TERM HUP
+
+  # drift-free pacing via EPOCHREALTIME (builtin, no forks). Only sleep() forks.
+  # Frame-skipping video-player style: if terminal is slower than target fps,
+  # skip ahead to the frame due NOW instead of playing every frame in slow motion.
+  local now_us next_us sleep_s i l
+  now_us=${EPOCHREALTIME/./}
+  next_us=$((10#$now_us))
+
+  # cumulative offsets for skipping (CUM[0]=0, CUM[i]=start time of frame i)
+  local -a CUM=()
+  CUM[0]=0
+  for ((i=0; i<n_frames; i++)); do
+    CUM[i+1]=$((CUM[i] + 10#${DELAY_US[i]:-100000}))
+  done
+  local total_us=${CUM[n_frames]:-100000}
+
+  sleep_until_next() {
+    # $1 = deadline in us; sleeps remainder; returns 0 slept, 1 already late
+    local deadline=$1 now sleep_u
+    now=${EPOCHREALTIME/./}
+    sleep_u=$((deadline - 10#$now))
+    if ((sleep_u > 0)); then
+      printf -v sleep_s '%d.%06d' $((sleep_u/1000000)) $((sleep_u%1000000))
+      sleep "$sleep_s"
+      return 0
+    fi
+    return 1
+  }
+
+  # first==1 → no cursor move (first draw); else atomic move+redraw in one write
+  local first_draw=1
+  show_next() {
+    if ((first_draw)); then
+      printf '%s\n' "${SCREENS[$1]}"
+      first_draw=0
+    else
+      printf '\e[%dA%s\n' "$screen_h" "${SCREENS[$1]}"
+    fi
+  }
+
+  if (( LOOPS == 0 )); then
+    # infinite: keep global timeline, skip frames when terminal can't keep up
+    local pass_start=$next_us idx now elapsed target
+    while :; do
+      now=${EPOCHREALTIME/./}
+      # if >1s behind timeline (terminal hung), restart live instead of bursting
+      if (((10#$now - pass_start) > 1000000)); then pass_start=$((10#$now)); fi
+      # find frame due now within this pass
+      now=${EPOCHREALTIME/./}
+      elapsed=$((10#$now - pass_start))
+      idx=0
+      while ((idx+1 < n_frames && CUM[idx+1] <= elapsed)); do idx=$((idx+1)); done
+      show_next "$idx"
+      if ((idx+1 >= n_frames)); then
+        # wait out last frame's duration, then wrap (skips if terminal is slow)
+        target=$((pass_start + total_us))
+        next_us=$target
+        sleep_until_next "$target"
+        pass_start=$((pass_start + total_us))
+        continue
+      fi
+      target=$((pass_start + CUM[idx+1]))
+      next_us=$target
+      sleep_until_next "$target"
+    done
+  else
+    # finite: LOOPS passes back-to-back on one timeline (no gap drift)
+    local pass_start=$next_us p idx now elapsed target
+    local dbg_shown=0 dbg_skipped=0 dbg_prev=-1 dbg_t0=0 dbg_t1=0
+    now=${EPOCHREALTIME/./}; dbg_t0=$((10#$now))
+    for ((p=0; p<LOOPS; p++)); do
+      if ((p > 0)); then
+        pass_start=$((pass_start + total_us))
+        now=${EPOCHREALTIME/./}
+        if (((10#$now - pass_start) > 1000000)); then pass_start=$((10#$now)); fi
+        dbg_prev=-1
+      fi
+      while :; do
+        now=${EPOCHREALTIME/./}
+        elapsed=$((10#$now - pass_start))
+        idx=0
+        while ((idx+1 < n_frames && CUM[idx+1] <= elapsed)); do idx=$((idx+1)); done
+        show_next "$idx"
+        dbg_shown=$((dbg_shown+1))
+        if ((dbg_prev >= 0 && idx > dbg_prev+1)); then dbg_skipped=$((dbg_skipped + idx-dbg_prev-1)); fi
+        dbg_prev=$idx
+        if ((idx+1 >= n_frames)); then break; fi
+        target=$((pass_start + CUM[idx+1]))
+        next_us=$target
+        sleep_until_next "$target"
+      done
+      if ((p == LOOPS-1)); then break; fi
+      # wait out last frame before next pass (keeps inter-pass gap exact;
+      # skipped automatically if terminal is slow)
+      target=$((pass_start + total_us))
+      next_us=$target
+      sleep_until_next "$target"
+    done
+    now=${EPOCHREALTIME/./}; dbg_t1=$((10#$now))
+    if [[ -n "${FETCH_DEBUG:-}" ]]; then
+      local wall_us=$((dbg_t1-dbg_t0)) timeline_us=$((total_us*LOOPS))
+      local eff="?"
+      if ((wall_us > 0)); then eff=$(awk -v s="$dbg_shown" -v w="$wall_us" 'BEGIN{printf "%.1f", s*1000000/w}'); fi
+      dbg "playback: shown $dbg_shown/$((n_frames*LOOPS)) frames (skipped $dbg_skipped) in $((wall_us/1000))ms wall vs $((timeline_us/1000))ms timeline (effective ${eff}fps)"
+    fi
+    printf '%s' "$SHOW"
+    trap - INT TERM HUP
+    rm -rf "$tmpdir"
+    return 0
+  fi
+}
+
 # main dispatcher: prints ascii art to stdout, returns 0 on success
 print_image_ascii() {
   local file="$1"
@@ -751,11 +1479,21 @@ print_image_ascii() {
 main() {
   local -a ART=()
   local art_width="$WIDTH"
+  local tmp rc
 
   if [[ -n "$IMAGE" && "$SHOW_INFO" != "off" || -n "$IMAGE" ]]; then :; fi
 
   if [[ -n "$IMAGE" ]]; then
-    # capture rendered lines preserving ANSI
+    # animated GIF / WebP / APNG → terminal animation (unless --static / piped)
+    if should_animate "$IMAGE"; then
+      run_animated_image "$IMAGE"
+      rc=$?
+      if [[ $rc -eq 0 ]]; then return 0; fi
+      if [[ $rc -ne 5 ]]; then exit "$rc"; fi
+      dbg "static fallback for $IMAGE (single-frame or backend missing)"
+      # rc==5 → not actually animated / backend missing: fall through to static
+    fi
+    # static: capture rendered lines preserving ANSI
     tmp="$(mktemp)"
     if ! print_image_ascii "$IMAGE" > "$tmp"; then rm -f "$tmp"; exit 1; fi
     mapfile -t ART < "$tmp"
